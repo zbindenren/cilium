@@ -8,10 +8,20 @@ pipeline {
     environment {
         PROJ_PATH = "src/github.com/cilium/cilium"
         VM_MEMORY = "8192"
-        K8S_VERSION="1.17"
+        K8S_VERSION= """${sh(
+            returnStdout: true,
+            script: 'echo -n ${JobK8sVersion:-1.17}'
+            )}"""
         TESTED_SUITE="k8s-${K8S_VERSION}"
         GINKGO_TIMEOUT="300m"
-        DEFAULT_KERNEL="419"
+        DEFAULT_KERNEL="""${sh(
+            returnStdout: true,
+            script: 'echo -n ${JobKernelVersion-419}'
+            )}"""
+        NETNEXT="""${sh(
+            returnStdout: true,
+            script: 'if [[ $DEFAULT_KERNEL == "net-next" ]]; then echo -n "1"; fi'
+            )}"""
     }
 
     options {
@@ -126,7 +136,7 @@ pipeline {
                 unsuccessful {
                     script {
                         if  (!currentBuild.displayName.contains('fail')) {
-                            currentBuild.displayName = 'K8s 1.17 vm provisioning fail\n' + currentBuild.displayName
+                            currentBuild.displayName = 'K8s vm provisioning fail\n' + currentBuild.displayName
                         }
                     }
                 }
@@ -140,7 +150,6 @@ pipeline {
                 GOPATH="${WORKSPACE}/${TESTED_SUITE}-gopath"
                 TESTDIR="${GOPATH}/${PROJ_PATH}/test"
                 KUBECONFIG="${TESTDIR}/vagrant-kubeconfig"
-                K8S_VERSION="1.17"
                 FAILFAST=setIfLabel("ci/fail-fast", "true", "false")
                 CONTAINER_RUNTIME=setIfLabel("area/containerd", "containerd", "docker")
             }
@@ -160,7 +169,7 @@ pipeline {
                 unsuccessful {
                     script {
                         if  (!currentBuild.displayName.contains('fail')) {
-                            currentBuild.displayName = 'K8s 1.17 fail\n' + currentBuild.displayName
+                            currentBuild.displayName = 'K8s tests fail\n' + currentBuild.displayName
                         }
                     }
                 }
