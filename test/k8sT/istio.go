@@ -70,6 +70,12 @@ var _ = Describe("K8sIstioTest", func() {
 		res.ExpectSuccess("unable to download %s", ciliumIstioctlURL)
 		res = kubectl.ExecShort("./cilium-istioctl version")
 		res.ExpectSuccess("unable to execute cilium-istioctl")
+		res = kubectl.ExecShort("which kubectl")
+		res.ExpectSuccess("unable to execute 'which kubectl'")
+		res = kubectl.ExecShort("echo $PATH")
+		res.ExpectSuccess("unable to execute 'echo PATH'")
+		res = kubectl.ExecShort("`which kubectl` version")
+		res.ExpectSuccess("unable to execute '`which kubectl` version'")
 
 		ciliumFilename = helpers.TimestampFilename("cilium.yaml")
 		DeployCiliumAndDNS(kubectl, ciliumFilename)

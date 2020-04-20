@@ -30,7 +30,7 @@ run:
 	ginkgo --focus " Runtime*" -v -- --cilium.provision=$(provision)
 
 k8s:
-	ginkgo --focus " K8s*" -v -- --cilium.provision=$(provision)
+	ginkgo --focus " K8s.*Istio.*" -v -- --cilium.provision=$(provision)
 
 nightly:
 	ginkgo --focus " Nightly*" -v -- --cilium.provision=$(provision)
