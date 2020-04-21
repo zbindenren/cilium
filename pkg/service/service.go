@@ -27,6 +27,7 @@ import (
 	"github.com/cilium/cilium/pkg/metrics"
 	monitorAPI "github.com/cilium/cilium/pkg/monitor/api"
 	nodeTypes "github.com/cilium/cilium/pkg/node/types"
+	"github.com/cilium/cilium/pkg/option"
 	"github.com/cilium/cilium/pkg/service/healthserver"
 
 	"github.com/sirupsen/logrus"
@@ -40,12 +41,15 @@ var (
 
 // LBMap is the interface describing methods for manipulating service maps.
 type LBMap interface {
-	UpsertService(uint16, net.IP, uint16, []uint16, int, bool, lb.SVCType, bool) error
+	UpsertService(uint16, net.IP, uint16, []uint16, int, bool, lb.SVCType, bool, bool, uint32) error
 	DeleteService(lb.L3n4AddrID, int) error
 	AddBackend(uint16, net.IP, uint16, bool) error
 	DeleteBackendByID(uint16, bool) error
+	AddAffinityMatch(uint16, uint16) error
+	DeleteAffinityMatch(uint16, uint16) error
 	DumpServiceMaps() ([]*lb.SVC, []error)
 	DumpBackendMaps() ([]*lb.Backend, error)
+	DumpAffinityMatches() (map[uint16]map[uint16]struct{}, error)
 }
 
 // healthServer is used to manage HealtCheckNodePort listeners
@@ -65,11 +69,13 @@ type svcInfo struct {
 	backends      []lb.Backend
 	backendByHash map[string]*lb.Backend
 
-	svcType                lb.SVCType
-	svcTrafficPolicy       lb.SVCTrafficPolicy
-	svcHealthCheckNodePort uint16
-	svcName                string
-	svcNamespace           string
+	svcType                   lb.SVCType
+	svcTrafficPolicy          lb.SVCTrafficPolicy
+	sessionAffinity           bool
+	sessionAffinityTimeoutSec uint32
+	svcHealthCheckNodePort    uint16
+	svcName                   string
+	svcNamespace              string
 
 	restoredFromDatapath bool
 }
@@ -192,7 +198,9 @@ func (s *Service) InitMaps(ipv6, ipv4, sockMaps, restore bool) error {
 // The first return value is true if the service hasn't existed before.
 func (s *Service) UpsertService(
 	frontend lb.L3n4AddrID, backends []lb.Backend, svcType lb.SVCType,
-	svcTrafficPolicy lb.SVCTrafficPolicy, svcHealthCheckNodePort uint16,
+	svcTrafficPolicy lb.SVCTrafficPolicy,
+	sessionAffinity bool, sessionAffinityTimeoutSec uint32,
+	svcHealthCheckNodePort uint16,
 	svcName, svcNamespace string) (bool, lb.ID, error) {
 
 	s.Lock()
@@ -207,11 +215,15 @@ func (s *Service) UpsertService(
 		logfields.ServiceHealthCheckNodePort: svcHealthCheckNodePort,
 		logfields.ServiceName:                svcName,
 		logfields.ServiceNamespace:           svcNamespace,
+
+		logfields.SessionAffinity:        sessionAffinity,
+		logfields.SessionAffinityTimeout: sessionAffinityTimeoutSec,
 	})
 	scopedLog.Debug("Upserting service")
 
 	// If needed, create svcInfo and allocate service ID
-	svc, new, err := s.createSVCInfoIfNotExist(frontend, svcType, svcTrafficPolicy,
+	svc, new, prevSessionAffinity, err := s.createSVCInfoIfNotExist(frontend, svcType, svcTrafficPolicy,
+		sessionAffinity, sessionAffinityTimeoutSec,
 		svcHealthCheckNodePort, svcName, svcNamespace)
 	if err != nil {
 		return false, lb.ID(0), err
@@ -234,10 +246,34 @@ func (s *Service) UpsertService(
 		backendsCopy = append(backendsCopy, *b.DeepCopy())
 	}
 
+	if prevSessionAffinity && !sessionAffinity {
+		// Remove backends from the affinity match because the svc's sessionAffinity
+		// has been disabled
+		ids := make([]lb.BackendID, 0, len(svc.backends))
+		for _, b := range svc.backends {
+			ids = append(ids, b.ID)
+		}
+		s.deleteBackendsFromAffinityMatchMap(svc.frontend.ID, ids)
+	} else if !prevSessionAffinity && sessionAffinity {
+		// The svc's session affinity has been just enabled, add the backends to
+		// the affinity match
+		ids := make([]lb.BackendID, 0, len(svc.backends))
+		for _, b := range svc.backends {
+			ids = append(ids, b.ID)
+		}
+		s.addBackendsToAffinityMatchMap(svc.frontend.ID, ids)
+	}
+
 	// Update backends cache and allocate/release backend IDs
-	newBackends, obsoleteBackendIDs, err := s.updateBackendsCacheLocked(svc, backendsCopy)
+	newBackends, obsoleteBackendIDs, newSVCBackendIDs, removedSVCBackendIDs, err := s.updateBackendsCacheLocked(svc, backendsCopy)
 	if err != nil {
 		return false, lb.ID(0), err
+	}
+
+	if sessionAffinity {
+		// Remove the removed backends from the affinity match, and add the new ones
+		s.addBackendsToAffinityMatchMap(svc.frontend.ID, newSVCBackendIDs)
+		s.deleteBackendsFromAffinityMatchMap(svc.frontend.ID, removedSVCBackendIDs)
 	}
 
 	// Update lbmaps (BPF service maps)
@@ -333,10 +369,57 @@ func (s *Service) RestoreServices() error {
 		return err
 	}
 
+	// Remove no longer existing affinity matches
+	if err := s.deleteOrphanAffinityMatchesLocked(); err != nil {
+		return err
+	}
+
 	// Remove obsolete backends and release their IDs
 	if err := s.deleteOrphanBackends(); err != nil {
 		log.WithError(err).Warn("Failed to remove orphan backends")
 
+	}
+
+	return nil
+}
+
+// deleteOrphanAffinityMatchesLocked removes affinity matches which point to no
+// longer existing svc ID and backend ID tuples.
+func (s *Service) deleteOrphanAffinityMatchesLocked() error {
+	matches, err := s.lbmap.DumpAffinityMatches()
+	if err != nil {
+		return err
+	}
+
+	toRemove := map[lb.ID][]lb.BackendID{}
+
+	local := make(map[lb.ID]map[lb.BackendID]struct{}, len(s.svcByID))
+	for id, svc := range s.svcByID {
+		if !svc.sessionAffinity {
+			continue
+		}
+		local[id] = make(map[lb.BackendID]struct{}, len(svc.backends))
+		for _, backend := range svc.backends {
+			local[id][backend.ID] = struct{}{}
+		}
+	}
+
+	for svcID, backendIDs := range matches {
+		for bID := range backendIDs {
+			found := false
+			if _, ok := local[lb.ID(svcID)]; ok {
+				if _, ok := local[lb.ID(svcID)][lb.BackendID(bID)]; ok {
+					found = true
+				}
+			}
+			if !found {
+				toRemove[lb.ID(svcID)] = append(toRemove[lb.ID(svcID)], lb.BackendID(bID))
+			}
+		}
+	}
+
+	for svcID, backendIDs := range toRemove {
+		s.deleteBackendsFromAffinityMatchMap(svcID, backendIDs)
 	}
 
 	return nil
@@ -371,17 +454,19 @@ func (s *Service) createSVCInfoIfNotExist(
 	frontend lb.L3n4AddrID,
 	svcType lb.SVCType,
 	svcTrafficPolicy lb.SVCTrafficPolicy,
+	sessionAffinity bool, sessionAffinityTimeoutSec uint32,
 	svcHealthCheckNodePort uint16,
 	svcName, svcNamespace string,
-) (*svcInfo, bool, error) {
+) (*svcInfo, bool, bool, error) {
 
+	prevSessionAffinity := false
 	hash := frontend.Hash()
 	svc, found := s.svcByHash[hash]
 	if !found {
 		// Allocate service ID for the new service
 		addrID, err := AcquireID(frontend.L3n4Addr, uint32(frontend.ID))
 		if err != nil {
-			return nil, false,
+			return nil, false, false,
 				fmt.Errorf("Unable to allocate service ID %d for %v: %s",
 					frontend.ID, frontend, err)
 		}
@@ -396,15 +481,21 @@ func (s *Service) createSVCInfoIfNotExist(
 			svcName:      svcName,
 			svcNamespace: svcNamespace,
 
+			sessionAffinity:           sessionAffinity,
+			sessionAffinityTimeoutSec: sessionAffinityTimeoutSec,
+
 			svcTrafficPolicy:       svcTrafficPolicy,
 			svcHealthCheckNodePort: svcHealthCheckNodePort,
 		}
 		s.svcByID[frontend.ID] = svc
 		s.svcByHash[hash] = svc
 	} else {
+		prevSessionAffinity = svc.sessionAffinity
 		svc.svcType = svcType
 		svc.svcTrafficPolicy = svcTrafficPolicy
 		svc.svcHealthCheckNodePort = svcHealthCheckNodePort
+		svc.sessionAffinity = sessionAffinity
+		svc.sessionAffinityTimeoutSec = sessionAffinityTimeoutSec
 		// Name and namespace are both optional and intended for exposure via
 		// API. They they are not part of any BPF maps and cannot be restored
 		// from datapath.
@@ -420,7 +511,38 @@ func (s *Service) createSVCInfoIfNotExist(
 		svc.restoredFromDatapath = false
 	}
 
-	return svc, !found, nil
+	return svc, !found, prevSessionAffinity, nil
+}
+
+// TODO(brb) probably return error
+func (s *Service) deleteBackendsFromAffinityMatchMap(svcID lb.ID, backendIDs []lb.BackendID) {
+	if !option.Config.EnableSessionAffinity {
+		return
+	}
+
+	for _, bID := range backendIDs {
+		if err := s.lbmap.DeleteAffinityMatch(uint16(svcID), uint16(bID)); err != nil {
+			log.WithFields(logrus.Fields{
+				logfields.BackendID: bID,
+				logfields.ServiceID: svcID,
+			}).WithError(err).Warn("Unable to remove entry from affinity match map")
+		}
+	}
+}
+
+func (s *Service) addBackendsToAffinityMatchMap(svcID lb.ID, backendIDs []lb.BackendID) {
+	if !option.Config.EnableSessionAffinity {
+		return
+	}
+
+	for _, bID := range backendIDs {
+		if err := s.lbmap.AddAffinityMatch(uint16(svcID), uint16(bID)); err != nil {
+			log.WithFields(logrus.Fields{
+				logfields.BackendID: bID,
+				logfields.ServiceID: svcID,
+			}).WithError(err).Warn("Unable to add entry to affinity match map")
+		}
+	}
 }
 
 func (s *Service) upsertServiceIntoLBMaps(svc *svcInfo, prevBackendCount int,
@@ -460,7 +582,8 @@ func (s *Service) upsertServiceIntoLBMaps(svc *svcInfo, prevBackendCount int,
 		uint16(svc.frontend.ID), svc.frontend.L3n4Addr.IP,
 		svc.frontend.L3n4Addr.L4Addr.Port,
 		backendIDs, prevBackendCount,
-		ipv6, svcType, svc.requireNodeLocalBackends())
+		ipv6, svcType, svc.requireNodeLocalBackends(),
+		svc.sessionAffinity, svc.sessionAffinityTimeoutSec)
 	if err != nil {
 		return err
 	}
@@ -548,6 +671,10 @@ func (s *Service) restoreServicesLocked() error {
 			// service cache has been initialized
 			svcType:          svc.Type,
 			svcTrafficPolicy: svc.TrafficPolicy,
+
+			sessionAffinity:           svc.SessionAffinity,
+			sessionAffinityTimeoutSec: svc.SessionAffinityTimeoutSec,
+
 			// Indicate that the svc was restored from the BPF maps, so that
 			// SyncWithK8sFinished() could remove services which were restored
 			// from the maps but not present in the k8sServiceCache (e.g. a svc
@@ -588,6 +715,15 @@ func (s *Service) deleteServiceLocked(svc *svcInfo) error {
 		return err
 	}
 
+	// Delete affinity matches
+	if svc.sessionAffinity {
+		backendIDs := make([]lb.BackendID, 0, len(svc.backendByHash))
+		for _, backend := range svc.backendByHash {
+			backendIDs = append(backendIDs, backend.ID)
+		}
+		s.deleteBackendsFromAffinityMatchMap(svc.frontend.ID, backendIDs)
+	}
+
 	delete(s.svcByHash, svc.hash)
 	delete(s.svcByID, svc.frontend.ID)
 
@@ -613,10 +749,12 @@ func (s *Service) deleteServiceLocked(svc *svcInfo) error {
 }
 
 func (s *Service) updateBackendsCacheLocked(svc *svcInfo, backends []lb.Backend) (
-	[]lb.Backend, []lb.BackendID, error) {
+	[]lb.Backend, []lb.BackendID, []lb.BackendID, []lb.BackendID, error) {
 
-	obsoleteBackendIDs := []lb.BackendID{}
-	newBackends := []lb.Backend{}
+	obsoleteBackendIDs := []lb.BackendID{}   // not used by any SVC
+	removedSVCBackendIDs := []lb.BackendID{} // removed from SVC, but might be used by other SVCs
+	newSVCBackendIDs := []lb.BackendID{}
+	newBackends := []lb.Backend{} // previously not used by any SVC
 	backendSet := map[string]struct{}{}
 
 	for i, backend := range backends {
@@ -627,7 +765,7 @@ func (s *Service) updateBackendsCacheLocked(svc *svcInfo, backends []lb.Backend)
 			if s.backendRefCount.Add(hash) {
 				id, err := AcquireBackendID(backend.L3n4Addr)
 				if err != nil {
-					return nil, nil, fmt.Errorf("Unable to acquire backend ID for %q: %s",
+					return nil, nil, nil, nil, fmt.Errorf("Unable to acquire backend ID for %q: %s",
 						backend.L3n4Addr, err)
 				}
 				backends[i].ID = id
@@ -638,6 +776,7 @@ func (s *Service) updateBackendsCacheLocked(svc *svcInfo, backends []lb.Backend)
 				backends[i].ID = s.backendByHash[hash].ID
 			}
 			svc.backendByHash[hash] = &backends[i]
+			newSVCBackendIDs = append(newSVCBackendIDs, backends[i].ID)
 		} else {
 			backends[i].ID = b.ID
 		}
@@ -645,18 +784,18 @@ func (s *Service) updateBackendsCacheLocked(svc *svcInfo, backends []lb.Backend)
 
 	for hash, backend := range svc.backendByHash {
 		if _, found := backendSet[hash]; !found {
+			removedSVCBackendIDs = append(removedSVCBackendIDs, backend.ID)
 			if s.backendRefCount.Delete(hash) {
 				DeleteBackendID(backend.ID)
 				delete(s.backendByHash, hash)
 				obsoleteBackendIDs = append(obsoleteBackendIDs, backend.ID)
 			}
-
 			delete(svc.backendByHash, hash)
 		}
 	}
 
 	svc.backends = backends
-	return newBackends, obsoleteBackendIDs, nil
+	return newBackends, obsoleteBackendIDs, newSVCBackendIDs, removedSVCBackendIDs, nil
 }
 
 func (s *Service) deleteBackendsFromCacheLocked(svc *svcInfo) []lb.BackendID {
