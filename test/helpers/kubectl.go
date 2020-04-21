@@ -118,12 +118,16 @@ var (
 	}
 
 	gkeHelmOverrides = map[string]string{
-		"global.ipv6.enabled":         "false",
-		"global.nodeinit.enabled":     "true",
-		"nodeinit.reconfigureKubelet": "true",
-		"nodeinit.removeCbrBridge":    "true",
-		"global.cni.binPath":          "/home/kubernetes/bin",
-		"global.nodePort.mode":        "snat",
+		"global.ipv6.enabled":           "false",
+		"global.nodeinit.enabled":       "true",
+		"nodeinit.reconfigureKubelet":   "true",
+		"nodeinit.removeCbrBridge":      "true",
+		"global.cni.binPath":            "/home/kubernetes/bin",
+		"global.nodePort.mode":          "snat",
+		"global.k8s.requireIPv4PodCIDR": "true",
+		"global.tunnel":                 "disabled",
+		"global.endpointRoutes.enabled": "true",
+		"global.nativeRoutingCIDR":      "10.0.0.0/8",
 	}
 
 	microk8sHelmOverrides = map[string]string{
