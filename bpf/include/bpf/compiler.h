@@ -28,6 +28,10 @@
 # define __packed		__attribute__((packed))
 #endif
 
+#ifndef __nobuiltin
+# define __nobuiltin(X)		__attribute__((no_builtin(X)))
+#endif
+
 #ifndef likely
 # define likely(X)		__builtin_expect(!!(X), 1)
 #endif
@@ -49,6 +53,10 @@
 
 #ifndef build_bug_on
 # define build_bug_on(E)	((void)sizeof(char[1 - 2*!!(E)]))
+#endif
+
+#ifndef __throw_build_bug
+# define __throw_build_bug()	__builtin_trap()
 #endif
 
 #ifndef __printf
